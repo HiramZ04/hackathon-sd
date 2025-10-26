@@ -1,6 +1,4 @@
 import os
-import io
-import time
 import math
 import uuid
 import sqlite3
@@ -10,52 +8,82 @@ from io import BytesIO
 import pandas as pd
 import streamlit as st
 import pydeck as pdk
-import requests
 from fpdf import FPDF
 import qrcode
 from PIL import Image
-from dotenv import load_dotenv
 
-# -----------------------------
-# Config inicial
-# -----------------------------
-st.set_page_config(page_title="OpenHealth SD - MVP", page_icon="🧭", layout="wide")
-load_dotenv()  # lee .env si existe
+# -------------------------------------------------
+# CONFIG
+# -------------------------------------------------
+st.set_page_config(page_title="OpenHealth SD - MVP", layout="wide")
 
 DATA_PATH = os.path.join("data", "resources_sample.csv")
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
-DEFAULT_CITY = "San Diego, US"
-DEFAULT_COORDS = (32.7157, -117.1611)  # centro SD
 
-# -----------------------------
-# Utils
-# -----------------------------
-def haversine_km(lat1, lon1, lat2, lon2):
-    R = 6371.0
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlmb = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb/2)**2
-    return 2 * R * math.asin(math.sqrt(a))
+# Centro aproximado (San Diego downtown)
+DEFAULT_COORDS = (32.7157, -117.1611)
 
-def load_resources():
-    if not os.path.exists(DATA_PATH):
-        return pd.DataFrame(columns=["name","type","address","lat","lon","hours","phone","notes"])
-    df = pd.read_csv(DATA_PATH)
-    # sanea tipos
-    df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
-    df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
-    return df.dropna(subset=["lat","lon"])
-
-# -----------------------------
-# DB simple para Salud (SQLite)
-# -----------------------------
+# DB local SQLite
 DB_PATH = "openhealth.db"
 
+# URL base que meteremos en el QR
+# Para demo local usamos localhost. Si deployas en Streamlit Cloud,
+# cambia esto a la URL publica de tu app (ej. https://tuapp.streamlit.app)
+BASE_URL = "http://localhost:8501"
+
+
+# -------------------------------------------------
+# UTILS: distancia y carga de recursos
+# -------------------------------------------------
+def haversine_km(lat1, lon1, lat2, lon2):
+    """
+    Distancia entre (lat1,lon1) y (lat2,lon2) en km usando haversine.
+    """
+    R = 6371.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+def load_resources():
+    """
+    Carga el CSV con ubicaciones de shelters, comida, etc.
+    Si no existe o esta vacio, devuelve DataFrame vacio con columnas esperadas.
+    """
+    if not os.path.exists(DATA_PATH):
+        return pd.DataFrame(
+            columns=["name", "type", "address", "lat", "lon", "hours", "phone", "notes"]
+        )
+
+    try:
+        df = pd.read_csv(DATA_PATH)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame(
+            columns=["name", "type", "address", "lat", "lon", "hours", "phone", "notes"]
+        )
+
+    # Asegurar numeric
+    df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+    df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+    df = df.dropna(subset=["lat", "lon"])
+    return df
+
+
+# -------------------------------------------------
+# DB LAYER
+# -------------------------------------------------
 def init_db():
+    """
+    Crea tablas si no existen:
+    - persons: perfil medico basico
+    - visits: visitas clinicas historicas
+    """
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS persons(
             id TEXT PRIMARY KEY,
             alias TEXT,
@@ -67,8 +95,10 @@ def init_db():
             notes TEXT,
             updated_at TEXT
         )
-    """)
-    cur.execute("""
+        """
+    )
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS visits(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             person_id TEXT,
@@ -77,60 +107,152 @@ def init_db():
             summary TEXT,
             FOREIGN KEY(person_id) REFERENCES persons(id)
         )
-    """)
+        """
+    )
     con.commit()
     con.close()
 
+
 def upsert_person(p):
+    """
+    Inserta o actualiza una persona (perfil medico).
+    p = {
+      "id": ...,
+      "alias": ...,
+      "birth_year": ...,
+      "conditions": ...,
+      "meds": ...,
+      "allergies": ...,
+      "critical_flags": ...,
+      "notes": ...
+    }
+    """
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("SELECT id FROM persons WHERE id=?", (p["id"],))
     exists = cur.fetchone() is not None
     now = datetime.utcnow().isoformat()
+
     if exists:
-        cur.execute("""
-            UPDATE persons SET alias=?, birth_year=?, conditions=?, meds=?, allergies=?,
-                   critical_flags=?, notes=?, updated_at=?
+        cur.execute(
+            """
+            UPDATE persons
+            SET alias=?, birth_year=?, conditions=?, meds=?, allergies=?,
+                critical_flags=?, notes=?, updated_at=?
             WHERE id=?
-        """, (p["alias"], p["birth_year"], p["conditions"], p["meds"], p["allergies"],
-              p["critical_flags"], p["notes"], now, p["id"]))
+            """,
+            (
+                p["alias"],
+                p["birth_year"],
+                p["conditions"],
+                p["meds"],
+                p["allergies"],
+                p["critical_flags"],
+                p["notes"],
+                now,
+                p["id"],
+            ),
+        )
     else:
-        cur.execute("""
-            INSERT INTO persons(id, alias, birth_year, conditions, meds, allergies, critical_flags, notes, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (p["id"], p["alias"], p["birth_year"], p["conditions"], p["meds"], p["allergies"],
-              p["critical_flags"], p["notes"], now))
+        cur.execute(
+            """
+            INSERT INTO persons(id, alias, birth_year, conditions, meds,
+                                allergies, critical_flags, notes, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                p["id"],
+                p["alias"],
+                p["birth_year"],
+                p["conditions"],
+                p["meds"],
+                p["allergies"],
+                p["critical_flags"],
+                p["notes"],
+                now,
+            ),
+        )
+
     con.commit()
     con.close()
+
 
 def get_person(person_id):
+    """
+    Devuelve un dict con los datos de la persona, o None si no existe.
+    """
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    cur.execute("SELECT id, alias, birth_year, conditions, meds, allergies, critical_flags, notes, updated_at FROM persons WHERE id=?", (person_id,))
+    cur.execute(
+        """
+        SELECT id, alias, birth_year, conditions, meds, allergies,
+               critical_flags, notes, updated_at
+        FROM persons
+        WHERE id=?
+        """,
+        (person_id,),
+    )
     row = cur.fetchone()
     con.close()
+
     if not row:
         return None
-    keys = ["id","alias","birth_year","conditions","meds","allergies","critical_flags","notes","updated_at"]
+
+    keys = [
+        "id",
+        "alias",
+        "birth_year",
+        "conditions",
+        "meds",
+        "allergies",
+        "critical_flags",
+        "notes",
+        "updated_at",
+    ]
     return dict(zip(keys, row))
 
+
 def add_visit(person_id, when_, provider, summary):
+    """
+    Agrega visita clinica al historial.
+    """
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    cur.execute("INSERT INTO visits(person_id, when_, provider, summary) VALUES(?,?,?,?)",
-                (person_id, when_, provider, summary))
+    cur.execute(
+        "INSERT INTO visits(person_id, when_, provider, summary) VALUES(?,?,?,?)",
+        (person_id, when_, provider, summary),
+    )
     con.commit()
     con.close()
 
+
 def get_visits(person_id):
+    """
+    Devuelve lista de visitas [{when, provider, summary}, ...]
+    """
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    cur.execute("SELECT when_, provider, summary FROM visits WHERE person_id=? ORDER BY when_ DESC", (person_id,))
+    cur.execute(
+        """
+        SELECT when_, provider, summary
+        FROM visits
+        WHERE person_id=?
+        ORDER BY when_ DESC
+        """,
+        (person_id,),
+    )
     rows = cur.fetchall()
     con.close()
     return [{"when": r[0], "provider": r[1], "summary": r[2]} for r in rows]
 
+
+# -------------------------------------------------
+# QR + PDF
+# -------------------------------------------------
 def make_qr_png(data_str):
+    """
+    Genera un PNG en memoria con el QR que contiene data_str.
+    """
     qr = qrcode.QRCode(version=2, box_size=6, border=2)
     qr.add_data(data_str)
     qr.make(fit=True)
@@ -141,128 +263,282 @@ def make_qr_png(data_str):
     return buf
 
 
+def pdf_from_person(person, visits):
+    """
+    Genera un PDF (BytesIO) con la info medica + historial + QR que apunta
+    a BASE_URL?id=<person_id>.
+    """
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=12)
+    pdf.add_page()
+
+    pdf.set_font("Arial", "B", 16)
+    pdf.cell(0, 10, "OpenHealth SD - Expediente", ln=True)
+
+    pdf.set_font("Arial", "", 11)
+
+    def safe_txt(x):
+        if x is None:
+            return "-"
+        s = str(x).strip()
+        return s if s != "" else "-"
+
+    def write_block(label, value, color=None):
+        if color:
+            pdf.set_text_color(*color)
+        else:
+            pdf.set_text_color(0, 0, 0)
+        pdf.multi_cell(0, 7, f"{label}: {safe_txt(value)}")
+        pdf.ln(1)
+
+    # Datos basicos
+    write_block("ID", person.get("id"))
+    write_block("Alias", person.get("alias"))
+    write_block("Ano nac", person.get("birth_year"))
+    write_block("Condiciones", person.get("conditions"))
+    write_block("Medicamentos", person.get("meds"))
+    write_block("Alergias", person.get("allergies"))
+    write_block("Flags criticos", person.get("critical_flags"), color=(200, 0, 0))
+    write_block("Notas", person.get("notes"))
+
+    pdf.ln(2)
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 8, "Historial de visitas", ln=True)
+    pdf.set_font("Arial", "", 11)
+
+    if not visits:
+        pdf.multi_cell(0, 7, "Sin visitas registradas")
+        pdf.ln(1)
+    else:
+        for v in visits[:20]:
+            block = f"- {v['when']} | {v['provider']}: {v['summary']}"
+            pdf.multi_cell(0, 6, block)
+            pdf.ln(1)
+
+    # QR en el PDF
+    pdf.ln(4)
+    pdf.set_font("Arial", "I", 10)
+    pdf.set_text_color(0, 0, 0)
+    pdf.cell(0, 8, "QR acceso rapido", ln=True)
+
+    qr_data = f"{BASE_URL}?id={person['id']}"
+    qr_buf = make_qr_png(qr_data)
+    tmp = BytesIO(qr_buf.read())
+    tmp.seek(0)
+    qr_img = Image.open(tmp)
+
+    img_path = f"qr_{person['id']}.png"
+    qr_img.save(img_path)
+    pdf.image(img_path, x=10, y=pdf.get_y(), w=30)
+    try:
+        os.remove(img_path)
+    except:
+        pass
+
+    output = BytesIO()
+    pdf.output(output)
+    output.seek(0)
+    return output
 
 
-# -----------------------------
-# UI: Header con tabs
-# -----------------------------
+# -------------------------------------------------
+# INICIALIZAR DB
+# -------------------------------------------------
+init_db()
+
+# leer query param ?id=xxxx del URL (para QR scan / deep link)
+qp = st.query_params  # Streamlit moderno
+incoming_id = qp.get("id")
+if isinstance(incoming_id, list):
+    incoming_id = incoming_id[0]
+
+
+# -------------------------------------------------
+# HEADER / NAV
+# -------------------------------------------------
 st.title("OpenHealth SD - MVP")
-
 tabs = st.tabs(["Mapa", "Salud QR", "Recursos", "News & Clima"])
 
-# -----------------------------
-# Tab 1: Mapa
-# -----------------------------
+
+# -------------------------------------------------
+# TAB 1: Mapa
+# -------------------------------------------------
 with tabs[0]:
     st.subheader("Mapa de recursos")
-    df = load_resources()
-    if df.empty:
-        st.info("Sin datos. Reemplaza data/resources_sample.csv con datasets del hackathon.")
-    colf1, colf2, colf3 = st.columns([2,1,1])
-    with colf1:
-        tipos = sorted(df["type"].dropna().unique().tolist())
-        sel_tipos = st.multiselect("Filtrar por tipo", tipos, default=tipos)
-    with colf2:
-        search_txt = st.text_input("Buscar por nombre o direccion", "")
-    with colf3:
+
+    df_map = load_resources()
+
+    if df_map.empty:
+        st.warning("No hay datos en data/resources_sample.csv todavia. Se mostrara demo.")
+        # demo minimo para que no truene el mapa
+        demo_lat, demo_lon = DEFAULT_COORDS
+        df_map = pd.DataFrame(
+            [
+                {
+                    "name": "Demo Shelter",
+                    "type": "Shelter",
+                    "address": "123 Demo St",
+                    "lat": demo_lat,
+                    "lon": demo_lon,
+                    "hours": "24 horas",
+                    "phone": "619-000-0000",
+                    "notes": "Ejemplo demo",
+                }
+            ]
+        )
+
+    # --- filtros básicos ---
+    tipos = sorted(df_map["type"].dropna().unique().tolist())
+    sel_tipos = st.multiselect(
+        "Filtrar por tipo",
+        options=tipos,
+        default=tipos,
+    )
+
+    col_a, col_b, col_c = st.columns([1, 1, 2])
+    with col_a:
+        max_km = st.slider(
+            "Radio km (mostrar cercanos primero)",
+            min_value=1,
+            max_value=30,
+            value=8,
+        )
+    with col_b:
         user_lat = st.number_input(
             "Tu lat",
             value=float(DEFAULT_COORDS[0]),
             format="%.6f",
-            key="map_lat",
         )
         user_lon = st.number_input(
             "Tu lon",
             value=float(DEFAULT_COORDS[1]),
             format="%.6f",
-            key="map_lon",
+        )
+    with col_c:
+        search_txt = st.text_input(
+            "Buscar por nombre/direccion (opcional)",
+            value="",
         )
 
-    radius_km = st.slider(
-        "Radio km (mostrar cercanos primero)",
-        1,
-        30,
-        10,
-        1,
-        key="map_radius",
-    )
+    # --- aplicar filtros ---
+    work_df = df_map.copy()
 
+    # por tipo
+    if sel_tipos:
+        work_df = work_df[work_df["type"].isin(sel_tipos)]
 
-    filtered = df[df["type"].isin(sel_tipos)].copy()
+    # texto
     if search_txt.strip():
-        s = search_txt.lower()
-        filtered = filtered[filtered.apply(
-            lambda r: s in str(r["name"]).lower() or s in str(r["address"]).lower(), axis=1
-        )]
-    # Distancia y orden
-    filtered["dist_km"] = filtered.apply(
-        lambda r: haversine_km(user_lat, user_lon, r["lat"], r["lon"]),
-        axis=1,
+        low = search_txt.strip().lower()
+        work_df = work_df[
+            work_df["name"].str.lower().str.contains(low)
+            | work_df["address"].str.lower().str.contains(low)
+        ]
+
+    # distancia
+    work_df["dist_km"] = work_df.apply(
+        lambda r: haversine_km(user_lat, user_lon, r["lat"], r["lon"]), axis=1
     )
-    filtered = filtered.sort_values("dist_km")
-    filtered = filtered[ filtered["dist_km"] <= radius_km ]
+    work_df = work_df.sort_values("dist_km")
+    work_df = work_df[work_df["dist_km"] <= max_km]
 
+    # mapa pydeck
+    color_map = {
+        "Shelter": [0, 92, 230],
+        "Food": [0, 160, 60],
+        "Medical": [200, 0, 0],
+        "Hygiene": [200, 160, 0],
+        "Community": [120, 0, 120],
+    }
+    work_df["color"] = work_df["type"].apply(
+        lambda t: color_map.get(str(t), [200, 0, 200])
+    )
 
-    # Capa pydeck
     tooltip = {
         "html": "<b>{name}</b><br/>{type}<br/>{address}<br/>Tel: {phone}<br/>Horario: {hours}<br/>{notes}",
-        "style": {"backgroundColor": "white", "color": "black"}
-    }
-    # Colores por tipo
-    # Colores por tipo
-    color_map = {
-        "Shelter":   [200, 0,   0],
-        "Food":      [0,   120, 0],
-        "Medical":   [0,   0,   200],
-        "Hygiene":   [120, 120, 0],
-        "Community": [120, 0,   120],
+        "style": {"backgroundColor": "white", "color": "black"},
     }
 
-# Para cada fila, asigna el color segun el tipo. Si no existe en el mapa, usa gris [80,80,80]
-    filtered["color"] = filtered["type"].apply(
-        lambda t: color_map.get(str(t), [80, 80, 80])   
+    view_state = pdk.ViewState(
+        latitude=user_lat,
+        longitude=user_lon,
+        zoom=12,
+        pitch=0,
     )
-
 
     layer = pdk.Layer(
         "ScatterplotLayer",
-        data=filtered,
+        data=work_df,
         get_position="[lon, lat]",
         get_radius=80,
         get_fill_color="color",
-        pickable=True
+        pickable=True,
     )
-    view_state = pdk.ViewState(latitude=user_lat, longitude=user_lon, zoom=12, pitch=0)
-    st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view_state, tooltip=tooltip, map_style="mapbox://styles/mapbox/light-v9"))
 
-    st.caption("Tip: reemplaza el CSV por el dataset oficial (shelters, food banks, clinicas, etc.).")
-    st.dataframe(filtered[["name","type","address","dist_km","hours","phone","notes"]].reset_index(drop=True))
+    deck_obj = pdk.Deck(
+        layers=[layer],
+        initial_view_state=view_state,
+        tooltip=tooltip,
+        map_style="mapbox://styles/mapbox/dark-v10",
+    )
 
-# -----------------------------
-# Tab 2: Salud QR
-# -----------------------------
+    st.pydeck_chart(deck_obj, use_container_width=True, height=400)
+
+    # tabla
+    st.caption(
+        "Tip: reemplaza el CSV por el dataset oficial de shelters, food banks, clinicas, etc."
+    )
+    st.dataframe(
+        work_df[
+            ["name", "type", "address", "dist_km", "hours", "phone", "notes"]
+        ].reset_index(drop=True),
+        use_container_width=True,
+    )
+
+
+# -------------------------------------------------
+# TAB 2: Salud QR
+# -------------------------------------------------
 with tabs[1]:
-    st.subheader("Expediente clinico basico + QR")
-    init_db()
+    st.subheader("Salud QR")
 
-    mode = st.radio("Accion", ["Registrar/Actualizar", "Consultar por ID"], horizontal=True)
+    mode = st.radio(
+        "Accion",
+        ["Registrar / Actualizar", "Consultar por ID"],
+        horizontal=True,
+        key="qr_mode",
+    )
 
-    if mode == "Registrar/Actualizar":
+    # ---------------------------
+    # REGISTRAR / ACTUALIZAR
+    # ---------------------------
+    if mode == "Registrar / Actualizar":
         with st.form("f_person"):
             c1, c2 = st.columns(2)
             with c1:
-                alias = st.text_input("Alias (no poner nombre real)", "")
-                birth_year = st.number_input("Ano de nacimiento (opcional)", min_value=1900, max_value=2100, value=1985)
-                conditions = st.text_area("Condiciones (diabetes, HTA, etc.)")
+                alias = st.text_input("Alias (no nombre legal)", "")
+                birth_year = st.number_input(
+                    "Ano nacimiento (opcional)",
+                    min_value=1900,
+                    max_value=2100,
+                    value=1985,
+                )
+                conditions = st.text_area(
+                    "Condiciones (ej. diabetes, HTA, asma, etc.)"
+                )
                 meds = st.text_area("Medicamentos")
             with c2:
                 allergies = st.text_area("Alergias")
-                critical_flags = st.text_area("Flags criticos (ej. anticoagulante, epilepsia, VIH, etc.)")
+                critical_flags = st.text_area(
+                    "Flags criticos (VIH+, epilepsia, anticoagulante, etc.)"
+                )
                 notes = st.text_area("Notas para personal medico")
-            submit = st.form_submit_button("Guardar")
 
-        if submit:
-            person_id = str(uuid.uuid4())[:8]  # ID corto
+            submit_new = st.form_submit_button("Guardar y generar QR")
+
+        if submit_new:
+            person_id = str(uuid.uuid4())[:8]  # ID corto tipo ab12cd34
+
             p = {
                 "id": person_id,
                 "alias": alias.strip() or "NA",
@@ -271,136 +547,138 @@ with tabs[1]:
                 "meds": meds.strip(),
                 "allergies": allergies.strip(),
                 "critical_flags": critical_flags.strip(),
-                "notes": notes.strip()
+                "notes": notes.strip(),
             }
             upsert_person(p)
+
             st.success(f"Guardado. ID asignado: {person_id}")
 
-            # QR + PDF
-            qr_png = make_qr_png(person_id)
-            st.image(qr_png, caption=f"QR ID {person_id}", width=160)
-            visits = []
-            pdf_buf = pdf_from_person(get_person(person_id), visits)
-            st.download_button("Descargar PDF", data=pdf_buf, file_name=f"openhealth_{person_id}.pdf", mime="application/pdf")
+            # QR con link directo usando ?id=<ID>
+            qr_url = f"{BASE_URL}?id={person_id}"
+            qr_png_buf = make_qr_png(qr_url)
 
-            st.info("Puedes imprimir el PDF y pegar el QR en una tarjeta. El QR solo contiene el ID del expediente.")
+            left, right = st.columns([1, 3])
+            with left:
+                st.image(qr_png_buf, caption=f"QR ID {person_id}", width=160)
+            with right:
+                st.write(
+                    "Escanear este QR abre OpenHealth con tu ID. "
+                    "Personal medico puede ver alergias / condiciones rapido "
+                    "sin pedir tu nombre legal."
+                )
+                st.write(
+                    "Tambien puedes bajar tu hoja medica (PDF) e imprimirla."
+                )
 
+                visits_list = []
+                pdf_buf = pdf_from_person(get_person(person_id), visits_list)
+                st.download_button(
+                    "Descargar PDF medico",
+                    data=pdf_buf,
+                    file_name=f"openhealth_{person_id}.pdf",
+                    mime="application/pdf",
+                )
+
+            st.write("Vista rapida de los datos guardados:")
+            st.json(get_person(person_id))
+
+    # ---------------------------
+    # CONSULTAR POR ID
+    # ---------------------------
     else:
-        qid = st.text_input("ID (desde QR o tarjeta)", "")
-        if st.button("Cargar"):
+        st.write(
+            "Pega el ID (o escanea un QR que abre esta pagina con ?id=TU_ID y se rellena solo)."
+        )
+
+        with st.form("f_lookup"):
+            qid_default = incoming_id if incoming_id else ""
+            qid = st.text_input(
+                "ID paciente",
+                value=qid_default,
+                key="lookup_text",
+            )
+            load_btn = st.form_submit_button("Cargar expediente")
+
+        if load_btn and qid.strip():
             person = get_person(qid.strip())
             if not person:
                 st.warning("No encontrado")
             else:
-                st.success(f"Expediente {qid}")
+                st.success(f"Expediente {qid.strip()}")
                 st.json(person)
-                visits = get_visits(qid)
-                st.write("Visitas:")
-                if visits:
-                    st.table(pd.DataFrame(visits))
+
+                # visitas existentes
+                visits_now = get_visits(qid.strip())
+                st.subheader("Visitas registradas")
+                if visits_now:
+                    st.table(pd.DataFrame(visits_now))
                 else:
                     st.caption("Sin visitas registradas")
 
+                # form para agregar visita
+                st.subheader("Agregar visita clinica")
                 with st.form("f_visit"):
-                    when_ = st.text_input("Fecha y hora (ISO, ej. 2025-10-26T10:30)", value=datetime.utcnow().isoformat(timespec="minutes"))
-                    provider = st.text_input("Proveedor (clinica, paramedico, etc.)", "")
+                    when_ = st.text_input(
+                        "Fecha y hora (ISO)",
+                        value=datetime.utcnow().isoformat(timespec="minutes"),
+                    )
+                    provider = st.text_input(
+                        "Proveedor (clinica, paramedico, etc.)", ""
+                    )
                     summary = st.text_area("Resumen clinico")
                     submit_v = st.form_submit_button("Agregar visita")
+
                 if submit_v:
-                    add_visit(qid, when_, provider, summary)
-                    st.success("Visita agregada")
-                    st.experimental_rerun()
+                    add_visit(qid.strip(), when_, provider, summary)
+                    st.success(
+                        "Visita agregada. Vuelve a 'Cargar expediente' para refrescar la tabla."
+                    )
 
-                # Exportar PDF actualizado
-                if st.button("Exportar PDF"):
-                    visits = get_visits(qid)
-                    pdf_buf = pdf_from_person(person, visits)
-                    st.download_button("Descargar PDF", data=pdf_buf, file_name=f"openhealth_{qid}.pdf", mime="application/pdf")
+                # exportar PDF actualizado
+                st.subheader("Exportar PDF actualizado")
+                visits_now = get_visits(qid.strip())
+                pdf_buf = pdf_from_person(person, visits_now)
+                st.download_button(
+                    "Descargar PDF medico (actualizado)",
+                    data=pdf_buf,
+                    file_name=f"openhealth_{qid.strip()}.pdf",
+                    mime="application/pdf",
+                )
 
-# -----------------------------
-# Tab 3: Recursos
-# -----------------------------
+
+# -------------------------------------------------
+# TAB 3: Recursos
+# -------------------------------------------------
 with tabs[2]:
-    st.subheader("Recursos y grupos de ayuda")
+    st.subheader("Recursos comunitarios")
+
     df_all = load_resources()
-    st.write("Directorio rapido (filtra por tipo o busca):")
-    c1, c2 = st.columns([1,2])
-    with c1:
-        sel = st.multiselect("Tipo", sorted(df_all["type"].unique().tolist()), default=None)
-    with c2:
-        q = st.text_input("Buscar texto", "")
-    dff = df_all.copy()
-    if sel:
-        dff = dff[dff["type"].isin(sel)]
-    if q.strip():
-        s = q.lower()
-        dff = dff[dff.apply(lambda r: s in str(r["name"]).lower() or s in str(r["address"]).lower() or s in str(r["notes"]).lower(), axis=1)]
-    st.dataframe(dff[["name","type","address","hours","phone","notes"]].reset_index(drop=True), use_container_width=True)
-
-    st.caption("Para usar datasets oficiales, reemplaza data/resources_sample.csv por el CSV del hackathon (shelters, food, medical, hygiene, community).")
-
-# -----------------------------
-# Tab 4: News & Clima
-# -----------------------------
-with tabs[3]:
-    st.subheader("News & clima para recomendaciones")
-    city = st.text_input("Ciudad para clima", value=DEFAULT_CITY, key="wx_city")
-
-    lat_user = st.number_input(
-        "Tu lat",
-        value=float(DEFAULT_COORDS[0]),
-        format="%.6f",
-        key="wx_lat",
-    )
-    lon_user = st.number_input(
-        "Tu lon",
-        value=float(DEFAULT_COORDS[1]),
-        format="%.6f",
-        key="wx_lon",
-    )
-
-    weather_box = st.empty()
-
-    def get_weather(city_name):
-        if not OPENWEATHER_API_KEY:
-            return None, "Sin API key. Pon OPENWEATHER_API_KEY en .env para clima real."
-        try:
-            url = f"https://api.openweathermap.org/data/2.5/weather?q={city_name}&appid={OPENWEATHER_API_KEY}&units=metric"
-            r = requests.get(url, timeout=8)
-            if r.status_code != 200:
-                return None, f"Error weather API: {r.text}"
-            return r.json(), None
-        except Exception as e:
-            return None, str(e)
-
-    wx, err = get_weather(city)
-    if err:
-        st.warning(err)
+    if df_all.empty:
+        st.warning("No hay datos todavia en data/resources_sample.csv.")
     else:
-        temp_c = wx["main"]["temp"]
-        desc = wx["weather"][0]["description"]
-        st.metric("Temperatura", f"{temp_c:.1f} C")
-        st.write("Condicion:", desc)
+        st.dataframe(
+            df_all[
+                ["name", "type", "address", "hours", "phone", "notes"]
+            ].reset_index(drop=True),
+            use_container_width=True,
+        )
 
-        cold = temp_c <= 8.0 or "cold" in desc.lower()
-        heat = temp_c >= 35.0
-        df_all = load_resources()
-        shelters = df_all[df_all["type"]=="Shelter"].copy()
-        if not shelters.empty:
-            shelters["dist_km"] = shelters.apply(lambda r: haversine_km(lat_user, lon_user, r["lat"], r["lon"]), axis=1)
-            shelters = shelters.sort_values("dist_km").head(5)
+    st.caption(
+        "Ejemplos de shelters, bancos de comida, clinicas, apoyo legal, higiene, etc."
+    )
 
-        if cold:
-            st.error("Hace mucho frio. Recomendacion: busca un shelter cercano.")
-            if not shelters.empty:
-                st.table(shelters[["name","address","dist_km","hours","phone"]])
-        elif heat:
-            st.warning("Alto calor. Recomendacion: puntos de agua o centros con aire acondicionado.")
-            water = df_all[df_all["type"].isin(["Hygiene","Community"])].copy()
-            if not water.empty:
-                water["dist_km"] = water.apply(lambda r: haversine_km(lat_user, lon_user, r["lat"], r["lon"]), axis=1)
-                st.table(water.sort_values("dist_km").head(5)[["name","type","address","dist_km","hours","phone"]])
-        else:
-            st.info("Clima moderado. Usa el mapa para ver recursos cercanos.")
 
-    st.caption("Para noticias locales, puedes integrar un RSS o API y mapear keywords como cold, storm, heat para activar alertas.")
+# -------------------------------------------------
+# TAB 4: News & Clima
+# -------------------------------------------------
+with tabs[3]:
+    st.subheader("Noticias y Clima")
+
+    st.write(
+        "⚠️ Clima frio esta noche. Busca un shelter cercano para dormir bajo techo."
+    )
+    st.write(
+        "Recomendacion: mantente hidratado, utiliza cobijas secas y evita zonas aisladas."
+    )
+    st.write("Si necesitas atencion medica urgente marca 911.")
+    st.write("Si necesitas apoyo no urgente, pide ayuda en el perfil 'Salud QR'.")
