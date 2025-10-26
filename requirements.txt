@@ -1,0 +1,8 @@
+streamlit
+pandas
+pydeck
+fpdf2
+qrcode
+Pillow
+requests
+python-dotenv
